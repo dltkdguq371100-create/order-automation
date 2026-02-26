@@ -6,10 +6,16 @@
 """
 
 import os
-from dotenv import load_dotenv
 import json
 import io
 import time
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Streamlit Cloud에서는 dotenv 불필요 (secrets 사용)
 
 import streamlit as st
 import pandas as pd
@@ -20,20 +26,21 @@ from PIL import Image
 # ──────────────────────────────────────────────
 # ★ 설정 ★
 # ──────────────────────────────────────────────
-# API 키: Streamlit secrets → .env 파일 → 환경변수 순서로 탐색
-load_dotenv()
+# API 키: Streamlit secrets → .env / 환경변수 순서로 탐색
 def _get_api_key():
     try:
         return st.secrets["GEMINI_API_KEY"]
     except Exception:
         key = os.environ.get("GEMINI_API_KEY")
         if not key:
-            st.error("❌ GEMINI_API_KEY가 설정되지 않았습니다. .env 파일 또는 .streamlit/secrets.toml을 확인하세요.")
+            st.error("❌ GEMINI_API_KEY가 설정되지 않았습니다.\n\n"
+                     "**로컬**: `.env` 파일에 `GEMINI_API_KEY=your_key` 추가\n\n"
+                     "**Streamlit Cloud**: Settings → Secrets에 `GEMINI_API_KEY = \"your_key\"` 추가")
             st.stop()
         return key
 
 GEMINI_API_KEY = _get_api_key()
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = Path(__file__).resolve().parent
 
 MART_OPTIONS = {
     "와마트": "기준_와.xlsx",
@@ -55,7 +62,11 @@ def get_genai_client():
 @st.cache_data
 def load_reference(ref_filename):
     """기준 파일을 로드하여 바코드→{자재코드, 단가} 딕셔너리 반환"""
-    ref_path = os.path.join(SCRIPT_DIR, ref_filename)
+    ref_path = BASE_DIR / ref_filename
+    if not ref_path.exists():
+        st.error(f"❌ 기준 파일을 찾을 수 없습니다: `{ref_filename}`\n\n"
+                 f"프로젝트 폴더에 해당 파일이 있는지 확인하세요.")
+        st.stop()
     df = pd.read_excel(ref_path)
     # 컬럼 순서: [0]바코드, [1]자재코드, [2]제품명, [3]단가
     ref_dict = {}
