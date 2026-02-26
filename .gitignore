@@ -1,0 +1,18 @@
+# API 키 (절대 커밋 금지!)
+.env
+.streamlit/secrets.toml
+
+# 결과 파일
+전산업로드용_결과.xlsx
+
+# 테스트 파일
+test_*.py
+_model_used.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
