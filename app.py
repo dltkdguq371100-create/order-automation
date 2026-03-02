@@ -62,14 +62,26 @@ def load_reference(ref_filename: str) -> dict:
     ref_dict = {}
     for idx in range(len(df)):
         try:
-            barcode_str = str(int(df.iloc[idx, 0]))
+            raw_val = df.iloc[idx, 0]
+            # 소수점 제거: 8.8012345678e+12 또는 '8801234567890.0' 등 처리
+            barcode_str = str(raw_val).strip()
+            if '.' in barcode_str:
+                barcode_str = barcode_str.split('.')[0]
+            # 순수 숫자가 아니면 int 변환 후 다시 문자열
+            if not barcode_str.isdigit():
+                barcode_str = str(int(float(raw_val)))
+            barcode_str = barcode_str.strip()
             ref_dict[barcode_str] = {
                 "자재코드": int(df.iloc[idx, 1]),
-                "제품명": str(df.iloc[idx, 2]),
+                "제품명": str(df.iloc[idx, 2]).strip(),
                 "단가": int(df.iloc[idx, 3]),
             }
         except (ValueError, TypeError):
             continue
+    print(f"[DEBUG] 기준파일 '{ref_filename}' 로드 완료: {len(ref_dict)}개 바코드")
+    if ref_dict:
+        sample_keys = list(ref_dict.keys())[:5]
+        print(f"[DEBUG] 바코드 샘플: {sample_keys}")
     return ref_dict
 
 
@@ -124,7 +136,10 @@ def _find_by_suffix(barcode: str, ref_dict: dict) -> list:
 
 def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
     """바코드 하나를 마스터에서 조회 (스마트 매칭: 정확매칭 → 14자리보정 → 뒷자리 검색)"""
+    # 철저한 전처리: str 변환 + strip + 소수점 제거
     barcode = str(barcode).strip()
+    if '.' in barcode:
+        barcode = barcode.split('.')[0].strip()
 
     # 1) 정확 일치
     if barcode in ref_dict:
@@ -143,21 +158,23 @@ def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
         candidates = _find_by_suffix(barcode, ref_dict)
 
         if len(candidates) == 1:
-            # 딱 하나만 일치 → 자동 교정
             matched_bc = candidates[0]
             info = ref_dict[matched_bc]
             return {"바코드": matched_bc, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 자동교정"}
 
         elif len(candidates) > 1:
-            # 여러 개 일치 → 앞자리 유사도로 최적 선택
             best_bc = max(candidates, key=lambda c: _barcode_similarity(barcode, c))
             info = ref_dict[best_bc]
             return {"바코드": best_bc, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 자동교정"}
 
-    # 4) 유효 바코드이지만 미등록
+    # 4) 유효 바코드이지만 미등록 — 디버깅 로그 출력
     if barcode.isdigit() and len(barcode) in (8, 12, 13, 14):
+        # 유사한 바코드가 마스터에 있는지 앞/뒤 5자리 비교 로그
+        similar = [k for k in ref_dict if k[-5:] == barcode[-5:]] if len(barcode) >= 5 else []
+        print(f"[DEBUG 미등록] AI값='{barcode}' (길이:{len(barcode)}) | 유사 마스터={similar[:5]}")
         return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "⚠️ 미등록"}
 
+    print(f"[DEBUG 확인필요] AI값='{barcode}' (길이:{len(barcode)}, 숫자여부:{barcode.isdigit()})")
     return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "❓ 바코드 확인"}
 
 
