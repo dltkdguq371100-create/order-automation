@@ -36,8 +36,8 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-# Groq 모델: llama-3.2-11b-vision-preview (이미지 분석 지원)
-GROQ_MODEL = "llama-3.2-90b-vision-preview"
+# Groq 모델: meta-llama/llama-4-scout-17b-16e-instruct (이미지 분석 + JSON 모드 지원)
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 # ──────────────────────────────────────────────
@@ -141,14 +141,9 @@ def analyze_image(uploaded_file, max_retries=3):
 - 단가나 금액과 혼동하지 마세요.
 
 [응답 형식]
-반드시 아래 JSON 배열로만 응답하세요. 다른 설명은 하지 마세요:
+반드시 아래 형식의 JSON 객체로만 응답하세요. 마크다운이나 다른 설명은 절대 포함하지 마세요:
 
-```json
-[
-  {"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3},
-  {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}
-]
-```"""
+{"items": [{"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3}, {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}]}"""
 
     # ── API 호출 전 2초 대기 (할당량 초과 방지) ──
     time.sleep(2)
@@ -177,16 +172,22 @@ def analyze_image(uploaded_file, max_retries=3):
                 ],
                 temperature=0.1,
                 max_tokens=4096,
+                response_format={"type": "json_object"},
             )
             text = response.choices[0].message.content.strip()
 
-            # JSON 추출
+            # JSON 추출 (JSON 모드이므로 순수 JSON 반환, 폴백으로 코드블록 처리)
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
 
-            items = json.loads(text)
+            parsed = json.loads(text)
+            # JSON 모드: {"items": [...]} 형태 또는 직접 배열 [...] 둘 다 지원
+            if isinstance(parsed, dict):
+                items = parsed.get("items", [])
+            else:
+                items = parsed
 
             results = []
             warnings = []
