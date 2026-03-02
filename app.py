@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-발주서 자동화 - Streamlit 웹 앱 v4.0
+발주서 자동화 - Streamlit 웹 앱 v5.0 (Groq API)
 
 기능:
   1. 마트 선택 (와 / 킹 / 팜) 라디오 버튼
   2. 발주서 사진 업로드 (st.file_uploader)
-  3. Gemini API 분석 (gemini-2.0-flash-lite / gemini-1.5-flash)
+  3. Groq API 분석 (llama-3.2-11b-vision-preview)
   4. st.data_editor 기반 검수 편집 [바코드, 수량, 제품명, 단가, 상태]
   5. 바코드/수량 수정 → 마스터 파일 실시간 대조
   6. 최종 확정 및 엑셀 다운로드 버튼
@@ -16,12 +16,13 @@
 import io
 import json
 import time
+import base64
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import openpyxl
-import google.generativeai as genai
+from groq import Groq
 from PIL import Image
 
 # ──────────────────────────────────────────────
@@ -35,7 +36,8 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-# 안정성을 위해 gemini-1.5-flash 단일 모델 사용 (analyze_image 함수 내 직접 지정)
+# Groq 모델: llama-3.2-11b-vision-preview (이미지 분석 지원)
+GROQ_MODEL = "llama-3.2-11b-vision-preview"
 
 
 # ──────────────────────────────────────────────
@@ -43,16 +45,9 @@ MART_OPTIONS = {
 # ──────────────────────────────────────────────
 
 @st.cache_resource
-def configure_genai():
-    """Gemini API 키 설정 (앱 전체에서 1회만 실행)"""
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    return True
-
-
-def get_model():
-    """Gemini 모델 인스턴스 반환"""
-    configure_genai()
-    return genai.GenerativeModel('gemini-1.5-flash')
+def get_groq_client():
+    """Groq 클라이언트 (앱 전체에서 1회만 생성)"""
+    return Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 @st.cache_data
@@ -106,10 +101,25 @@ def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
     return df
 
 
+def encode_image_to_base64(uploaded_file) -> str:
+    """업로드된 이미지를 base64 문자열로 변환"""
+    uploaded_file.seek(0)
+    return base64.b64encode(uploaded_file.read()).decode("utf-8")
+
+
 def analyze_image(uploaded_file, max_retries=3):
-    """Gemini API로 이미지에서 바코드+수량+제품명 추출 (gemini-1.5-flash 단일 모델)"""
-    model = get_model()
-    img = Image.open(uploaded_file)
+    """Groq API로 이미지에서 바코드+수량+제품명 추출 (llama-3.2-11b-vision-preview)"""
+    client = get_groq_client()
+
+    # 이미지를 base64로 인코딩
+    img_base64 = encode_image_to_base64(uploaded_file)
+
+    # 파일 확장자로 MIME 타입 결정
+    fname = uploaded_file.name.lower()
+    if fname.endswith(".png"):
+        mime_type = "image/png"
+    else:
+        mime_type = "image/jpeg"
 
     prompt = """이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
 
@@ -140,14 +150,35 @@ def analyze_image(uploaded_file, max_retries=3):
 ]
 ```"""
 
-    # ── API 호출 전 5초 대기 (할당량 초과 방지) ──
-    time.sleep(5)
+    # ── API 호출 전 2초 대기 (할당량 초과 방지) ──
+    time.sleep(2)
 
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = model.generate_content([prompt, img])
-            text = response.text.strip()
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{img_base64}",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            text = response.choices[0].message.content.strip()
 
             # JSON 추출
             if "```json" in text:
@@ -188,7 +219,7 @@ def analyze_image(uploaded_file, max_retries=3):
 
             if attempt < max_retries:
                 # 429 할당량 초과 → 길게 대기
-                if "429" in error_msg or "resource_exhausted" in error_msg:
+                if "429" in error_msg or "rate_limit" in error_msg:
                     wait = 30 * attempt
                     st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
                     time.sleep(wait)
@@ -463,4 +494,4 @@ if st.session_state.get("analysis_done"):
 
 # 푸터
 st.markdown("---")
-st.caption("발주서 자동화 v4.0 | Gemini AI 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
+st.caption("발주서 자동화 v5.0 | Groq AI (Llama Vision) 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
