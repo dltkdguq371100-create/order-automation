@@ -1,71 +1,62 @@
-# 📋 발주서 자동화
+# 📋 발주서 자동화 v4.0
 
-발주서 사진을 업로드하면 **Gemini AI**가 바코드와 수량을 자동 인식하고, 마트별 기준 파일과 대조하여 **전산 업로드용 엑셀**을 생성해주는 프로그램입니다.
+발주서 사진을 업로드하면 **Gemini AI**가 바코드·수량을 자동 인식하고,  
+마스터 파일과 대조하여 **전산 업로드용 엑셀**을 생성하는 Streamlit 웹 앱입니다.
 
-## 주요 기능
+## ✨ 주요 기능
 
-- 🏪 **마트 선택** — 와마트 / 킹마트 / 팜마트
-- 📷 **이미지 분석** — Gemini 2.5 Flash로 바코드(13자리) + 수량 자동 추출
-- 📊 **기준 파일 대조** — 자재코드 · 납품단가 자동 매칭
-- 📥 **엑셀 다운로드** — 전산 업로드 양식에 맞춘 결과 파일 생성
+| 기능 | 설명 |
+|---|---|
+| **마트 선택** | 와 / 킹 / 팜 셀렉트박스 |
+| **사진 업로드** | JPG·PNG 여러 장 동시 업로드 |
+| **AI 바코드 인식** | 880·489·693 접두사 13자리 우선, 8·12자리 허용 |
+| **검수 편집** | `st.data_editor`로 바코드·수량 직접 수정 |
+| **실시간 대조** | 바코드 수정 시 마스터 파일 기준 제품명·단가 자동 반영 |
+| **엑셀 다운로드** | 등록 항목만 전산업로드용 엑셀로 즉시 다운로드 |
 
-## 실행 방법
-
-### 1. 패키지 설치
+## 🚀 실행 방법
 
 ```bash
+# 1. 의존성 설치
 pip install -r requirements.txt
-```
 
-### 2. API 키 설정
+# 2. API 키 설정 (.streamlit/secrets.toml)
+# GEMINI_API_KEY = "your_api_key_here"
 
-`app.py` 상단의 `GEMINI_API_KEY`를 본인의 키로 변경하세요.
-
-> API 키는 [Google AI Studio](https://aistudio.google.com/apikey)에서 무료 발급 가능합니다.
-
-### 3. 기준 파일 준비
-
-아래 3개 파일을 프로젝트 폴더에 넣어주세요:
-
-| 파일명 | 설명 |
-|--------|------|
-| `기준_와.xlsx` | 와마트 품목 기준표 |
-| `기준_킹.xlsx` | 킹마트 품목 기준표 |
-| `기준_팜.xlsx` | 팜마트 품목 기준표 |
-
-기준 파일 컬럼: `바코드`, `자재코드`, `제품명`, `단가`
-
-### 4. 웹 앱 실행
-
-```bash
+# 3. 실행
 streamlit run app.py
 ```
 
-브라우저에서 `http://localhost:8501`이 자동으로 열립니다.
-
-### 5. CLI 실행 (선택)
-
-```bash
-python extract_order.py
-```
-
-## 파일 구조
+## 📁 프로젝트 구조
 
 ```
 발주서 자동화/
 ├── app.py                  # Streamlit 웹 앱 (메인)
-├── extract_order.py        # CLI 버전
-├── requirements.txt        # 패키지 목록
-├── .gitignore
-├── 기준_와.xlsx            # 마트별 기준 파일
-├── 기준_킹.xlsx
-├── 기준_팜.xlsx
-└── 주문등록 엑셀업로드.xlsx  # 출력 양식 참조
+├── requirements.txt        # Python 의존성
+├── .streamlit/
+│   └── secrets.toml        # API 키 (Git 제외)
+├── 기준_와.xlsx             # 와마트 마스터 파일
+├── 기준_킹.xlsx             # 킹마트 마스터 파일
+├── 기준_팜.xlsx             # 팜마트 마스터 파일
+└── .gitignore
 ```
 
-## 기술 스택
+## 🔧 기술 스택
 
-- **Python 3.12+**
-- **Streamlit** — 웹 UI
-- **Google Gemini AI** — 이미지 OCR
-- **pandas / openpyxl** — 엑셀 처리
+- **프론트엔드**: Streamlit
+- **AI 모델**: Gemini 2.0 Flash Lite (기본) / Gemini 1.5 Flash (폴백)
+- **데이터**: pandas, openpyxl
+- **API**: Google GenAI
+
+## ⚙️ API 키 설정
+
+### 로컬 실행
+`.streamlit/secrets.toml` 파일에 추가:
+```toml
+GEMINI_API_KEY = "your_api_key_here"
+```
+
+### Streamlit Cloud 배포
+Settings → Secrets에 동일하게 추가합니다.
+
+> ⚠️ `.streamlit/secrets.toml`과 `.env` 파일은 `.gitignore`에 포함되어 있어 GitHub에 업로드되지 않습니다.

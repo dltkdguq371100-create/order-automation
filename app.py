@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-발주서 자동화 - Streamlit 웹 앱
+발주서 자동화 - Streamlit 웹 앱 v4.0
+
+기능:
+  1. 마트 선택 (와 / 킹 / 팜) 라디오 버튼
+  2. 발주서 사진 업로드 (st.file_uploader)
+  3. Gemini API 분석 (gemini-2.0-flash-lite / gemini-1.5-flash)
+  4. st.data_editor 기반 검수 편집 [바코드, 수량, 제품명, 단가, 상태]
+  5. 바코드/수량 수정 → 마스터 파일 실시간 대조
+  6. 최종 확정 및 엑셀 다운로드 버튼
 
 실행: streamlit run app.py
 """
 
-import os
-import json
 import io
+import json
 import time
 from pathlib import Path
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # Streamlit Cloud에서는 dotenv 불필요 (secrets 사용)
 
 import streamlit as st
 import pandas as pd
@@ -26,27 +27,15 @@ from PIL import Image
 # ──────────────────────────────────────────────
 # ★ 설정 ★
 # ──────────────────────────────────────────────
-# API 키: Streamlit secrets → .env / 환경변수 순서로 탐색
-def _get_api_key():
-    try:
-        return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        key = os.environ.get("GEMINI_API_KEY")
-        if not key:
-            st.error("❌ GEMINI_API_KEY가 설정되지 않았습니다.\n\n"
-                     "**로컬**: `.env` 파일에 `GEMINI_API_KEY=your_key` 추가\n\n"
-                     "**Streamlit Cloud**: Settings → Secrets에 `GEMINI_API_KEY = \"your_key\"` 추가")
-            st.stop()
-        return key
-
-GEMINI_API_KEY = _get_api_key()
 BASE_DIR = Path(__file__).resolve().parent
 
 MART_OPTIONS = {
-    "와마트": "기준_와.xlsx",
-    "킹마트": "기준_킹.xlsx",
-    "팜마트": "기준_팜.xlsx",
+    "와": "기준_와.xlsx",
+    "킹": "기준_킹.xlsx",
+    "팜": "기준_팜.xlsx",
 }
+
+MODELS = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
 
 
 # ──────────────────────────────────────────────
@@ -56,109 +45,157 @@ MART_OPTIONS = {
 @st.cache_resource
 def get_genai_client():
     """Gemini 클라이언트 (앱 전체에서 1회만 생성)"""
-    return genai.Client(api_key=GEMINI_API_KEY)
+    api_key = st.secrets["GEMINI_API_KEY"]
+    return genai.Client(api_key=api_key)
 
 
 @st.cache_data
-def load_reference(ref_filename):
-    """기준 파일을 로드하여 바코드→{자재코드, 단가} 딕셔너리 반환"""
+def load_reference(ref_filename: str) -> dict:
+    """기준 파일을 로드하여 바코드→{자재코드, 제품명, 단가} 딕셔너리 반환"""
     ref_path = BASE_DIR / ref_filename
     if not ref_path.exists():
-        st.error(f"❌ 기준 파일을 찾을 수 없습니다: `{ref_filename}`\n\n"
-                 f"프로젝트 폴더에 해당 파일이 있는지 확인하세요.")
+        st.error(f"❌ 기준 파일을 찾을 수 없습니다: `{ref_filename}`")
         st.stop()
+
     df = pd.read_excel(ref_path)
-    # 컬럼 순서: [0]바코드, [1]자재코드, [2]제품명, [3]단가
     ref_dict = {}
     for idx in range(len(df)):
-        barcode_str = str(int(df.iloc[idx, 0]))
-        ref_dict[barcode_str] = {
-            "자재코드": int(df.iloc[idx, 1]),
-            "단가": int(df.iloc[idx, 3]),
-        }
+        try:
+            barcode_str = str(int(df.iloc[idx, 0]))
+            ref_dict[barcode_str] = {
+                "자재코드": int(df.iloc[idx, 1]),
+                "제품명": str(df.iloc[idx, 2]),
+                "단가": int(df.iloc[idx, 3]),
+            }
+        except (ValueError, TypeError):
+            continue
     return ref_dict
 
 
+def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
+    """바코드 하나를 마스터에서 조회하여 제품명, 단가, 상태 반환"""
+    barcode = str(barcode).strip()
+    if barcode in ref_dict:
+        info = ref_dict[barcode]
+        return {"제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 등록"}
+
+    # 유효 바코드이지만 미등록
+    if barcode.isdigit() and len(barcode) in (8, 12, 13):
+        return {"제품명": "", "단가": 0, "상태": "⚠️ 미등록"}
+
+    return {"제품명": "", "단가": 0, "상태": "❓ 바코드 확인"}
+
+
+def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
+    """DataFrame 전체에 대해 바코드 기반 제품명/단가/상태를 갱신"""
+    names, prices, statuses = [], [], []
+    for _, row in df.iterrows():
+        result = lookup_barcode(row.get("바코드", ""), ref_dict)
+        names.append(result["제품명"])
+        prices.append(result["단가"])
+        statuses.append(result["상태"])
+    df["제품명"] = names
+    df["단가"] = prices
+    df["상태"] = statuses
+    return df
+
+
 def analyze_image(uploaded_file, max_retries=3):
-    """Gemini API로 이미지에서 바코드+수량 추출"""
+    """Gemini API로 이미지에서 바코드+수량+제품명 추출"""
     client = get_genai_client()
     img = Image.open(uploaded_file)
 
-    prompt = ("이 발주서 이미지에서 바코드(상품코드)와 수량만 추출해줘. "
-              "바코드는 반드시 13자리 숫자여야 해. 수량은 정수로 추출해. "
-              "제품명, 단가, 합계 등은 무시해. "
-              '반드시 JSON 배열로만 응답해: [{"barcode": "1234567890123", "qty": 3}] '
-              "JSON만 응답하고 다른 설명은 하지 마.")
+    prompt = """이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[prompt, img],
-            )
-            text = response.text.strip()
+[표 구조 분석 규칙]
+- 발주서 표는 일반적으로 [번호, 제품명/규격, 바코드, 수량, 단가, 금액] 열로 구성됩니다.
+- 각 행에서 제품명, 바코드, 수량을 정확히 한 줄로 매칭하세요.
+- 절대로 단가(원), 금액(원), 합계 등 다른 숫자 열을 바코드로 혼동하지 마세요.
 
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
+[바코드 식별 규칙 - 매우 중요]
+- 880으로 시작하면 한국 바코드 (가장 흔함)
+- 489로 시작하면 홍콩 바코드
+- 693으로 시작하면 중국 바코드
+- 위 접두사로 시작하는 13자리 숫자를 최우선으로 바코드로 인식하세요.
+- 13자리가 아니더라도, 8자리 또는 12자리 숫자 코드도 바코드로 허용합니다.
+- 4~5자리 숫자는 단가, 5~7자리 숫자는 금액일 가능성이 높으니 바코드와 구별하세요.
 
-            items = json.loads(text)
+[수량 규칙]
+- 수량은 보통 1~999 범위의 작은 정수입니다.
+- 단가나 금액과 혼동하지 마세요.
 
-            results = []
-            warnings = []
-            for item in items:
-                barcode = str(item.get("barcode", "")).strip()
-                qty = item.get("qty", 0)
+[응답 형식]
+반드시 아래 JSON 배열로만 응답하세요. 다른 설명은 하지 마세요:
 
-                if not barcode.isdigit() or len(barcode) != 13:
-                    warnings.append(f"'{barcode}' ({len(barcode)}자리)")
-                    continue
+```json
+[
+  {"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3},
+  {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}
+]
+```"""
 
-                try:
-                    qty = int(qty)
-                except (ValueError, TypeError):
-                    qty = 0
+    last_error = None
+    for model_name in MODELS:
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, img],
+                )
+                text = response.text.strip()
 
-                results.append((barcode, qty))
+                # JSON 추출
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
 
-            return results, warnings
+                items = json.loads(text)
 
-        except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg and attempt < max_retries:
-                wait = 60 * attempt
-                st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
-                time.sleep(wait)
-            else:
-                st.error(f"❌ API 오류: {e}")
-                return [], []
+                results = []
+                warnings = []
+                for item in items:
+                    product_name = str(item.get("product_name", "")).strip()
+                    barcode = str(item.get("barcode", "")).strip()
+                    qty = item.get("qty", 0)
 
+                    # 바코드 유효성: 8, 12, 13자리 숫자 허용
+                    if not barcode.isdigit() or len(barcode) not in (8, 12, 13):
+                        warnings.append(f"'{barcode}' ({len(barcode)}자리) - {product_name}")
+                        continue
+
+                    try:
+                        qty = int(qty)
+                    except (ValueError, TypeError):
+                        qty = 0
+
+                    results.append({
+                        "바코드": barcode,
+                        "수량": qty,
+                        "제품명": product_name,
+                    })
+
+                return results, warnings
+
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                if "429" in error_msg and attempt < max_retries:
+                    wait = 30 * attempt
+                    st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
+                    time.sleep(wait)
+                elif attempt == max_retries:
+                    # 이 모델 포기, 다음 모델 시도
+                    break
+                else:
+                    break
+
+    st.error(f"❌ 모든 모델에서 분석 실패: {last_error}")
     return [], []
 
 
-def match_with_reference(order_data, ref_dict):
-    """바코드를 기준 파일과 대조"""
-    matched = []
-    unmatched = []
-
-    for barcode, qty in order_data:
-        if barcode in ref_dict:
-            info = ref_dict[barcode]
-            matched.append({
-                "자재코드": info["자재코드"],
-                "BOX": qty,
-                "EA": "",
-                "단가": info["단가"],
-            })
-        else:
-            unmatched.append({"바코드": barcode, "수량": qty, "상태": "❌ 확인 필요"})
-
-    return matched, unmatched
-
-
-def create_excel_bytes(matched_data):
-    """전산업로드용 엑셀을 메모리에 생성하여 bytes 반환"""
+def create_excel_bytes(final_df: pd.DataFrame, ref_dict: dict):
+    """확정된 데이터로 전산업로드용 엑셀 생성 (등록된 항목만 포함)"""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Sheet1"
@@ -172,16 +209,20 @@ def create_excel_bytes(matched_data):
     ws.cell(row=2, column=2, value="BOX")
     ws.cell(row=2, column=3, value="EA")
 
-    # 데이터
-    for i, item in enumerate(matched_data, start=3):
-        ws.cell(row=i, column=1, value=item["자재코드"])
-        ws.cell(row=i, column=2, value=item["BOX"])
-        ws.cell(row=i, column=4, value=item["단가"])
+    row_num = 3
+    for _, row in final_df.iterrows():
+        barcode = str(row.get("바코드", "")).strip()
+        if barcode in ref_dict:
+            info = ref_dict[barcode]
+            ws.cell(row=row_num, column=1, value=info["자재코드"])
+            ws.cell(row=row_num, column=2, value=int(row["수량"]))
+            ws.cell(row=row_num, column=4, value=info["단가"])
+            row_num += 1
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue(), row_num - 3
 
 
 # ──────────────────────────────────────────────
@@ -190,49 +231,39 @@ def create_excel_bytes(matched_data):
 
 st.set_page_config(page_title="발주서 자동화", page_icon="📋", layout="wide")
 
-# 커스텀 CSS
 st.markdown("""
 <style>
     .main-header {
         text-align: center;
-        padding: 1rem 0;
+        padding: 1.2rem 0;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 10px;
+        border-radius: 12px;
         color: white;
         margin-bottom: 2rem;
     }
-    .main-header h1 { color: white; margin: 0; }
-    .main-header p { color: rgba(255,255,255,0.8); margin: 0.5rem 0 0 0; }
+    .main-header h1 { color: white; margin: 0; font-size: 2rem; }
+    .main-header p  { color: rgba(255,255,255,0.85); margin: 0.4rem 0 0 0; }
     .stRadio > div { display: flex; gap: 1rem; }
-    .metric-card {
-        background: #f8f9fa;
-        border-radius: 8px;
-        padding: 1rem;
-        text-align: center;
-        border: 1px solid #e9ecef;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# 헤더
 st.markdown("""
 <div class="main-header">
-    <h1>📋 발주서 자동화</h1>
-    <p>발주서 사진 → 전산 업로드용 엑셀 자동 생성</p>
+    <h1>📋 발주서 자동화 v4.0</h1>
+    <p>사진 업로드 → AI 분석 → 검수 편집 → 전산 엑셀 다운로드</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Step 1: 마트 선택 ──
+# ── 1. 마트 선택 ──
 st.subheader("1️⃣ 마트 선택")
-selected_mart = st.radio(
+selected_mart = st.selectbox(
     "발주서를 보낸 마트를 선택하세요",
     list(MART_OPTIONS.keys()),
-    horizontal=True,
 )
 
 st.divider()
 
-# ── Step 2: 이미지 업로드 ──
+# ── 2. 발주서 사진 업로드 ──
 st.subheader("2️⃣ 발주서 사진 업로드")
 uploaded_files = st.file_uploader(
     "발주서 이미지를 선택하세요 (여러 장 가능)",
@@ -240,101 +271,188 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-# 업로드된 이미지 미리보기
 if uploaded_files:
     cols = st.columns(min(len(uploaded_files), 4))
     for i, f in enumerate(uploaded_files):
-        with cols[i % 4]:
+        with cols[i % len(cols)]:
             st.image(f, caption=f.name, use_container_width=True)
 
 st.divider()
 
-# ── Step 3: 분석 실행 ──
-st.subheader("3️⃣ 분석 실행")
+# ── 3. AI 분석 ──
+st.subheader("3️⃣ AI 분석")
 
 if uploaded_files:
     if st.button("🚀 분석 시작", type="primary", use_container_width=True):
         ref_file = MART_OPTIONS[selected_mart]
         ref_dict = load_reference(ref_file)
 
-        all_orders = []
+        all_results = []
         all_warnings = []
 
-        # 이미지별 분석
         progress = st.progress(0, text="분석 준비 중...")
         for i, f in enumerate(uploaded_files):
             progress.progress(
-                (i) / len(uploaded_files),
-                text=f"🔄 '{f.name}' 분석 중... ({i+1}/{len(uploaded_files)})"
+                i / len(uploaded_files),
+                text=f"🔄 '{f.name}' 분석 중... ({i + 1}/{len(uploaded_files)})",
             )
             f.seek(0)
             results, warnings = analyze_image(f)
-            all_orders.extend(results)
+            all_results.extend(results)
             all_warnings.extend(warnings)
 
         progress.progress(1.0, text="✅ 분석 완료!")
 
-        if not all_orders:
+        if not all_results:
             st.error("❌ 추출된 데이터가 없습니다. 이미지를 확인해 주세요.")
         else:
-            # 매칭
-            matched, unmatched = match_with_reference(all_orders, ref_dict)
+            df = pd.DataFrame(all_results, columns=["바코드", "수량", "제품명"])
+            df["단가"] = 0
+            df["상태"] = ""
+            df = apply_lookup(df, ref_dict)
 
-            # 결과 요약 카드
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("📷 분석 이미지", f"{len(uploaded_files)}장")
-            col2.metric("🔍 추출 바코드", f"{len(all_orders)}개")
-            col3.metric("✅ 매칭 성공", f"{len(matched)}개")
-            col4.metric("⚠️ 확인 필요", f"{len(unmatched)}개")
-
-            st.divider()
-
-            # ── 매칭 결과 표 ──
-            if matched:
-                st.subheader("📊 매칭 결과")
-                df_matched = pd.DataFrame(matched)
-                st.dataframe(
-                    df_matched,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "자재코드": st.column_config.NumberColumn("자재코드", format="%d"),
-                        "BOX": st.column_config.NumberColumn("BOX (수량)"),
-                        "EA": st.column_config.TextColumn("EA"),
-                        "단가": st.column_config.NumberColumn("단가", format="%d원"),
-                    },
-                )
-
-            # ── 확인 필요 항목 ──
-            if unmatched:
-                st.subheader("⚠️ 확인 필요 (기준 파일에 없는 바코드)")
-                df_unmatched = pd.DataFrame(unmatched)
-                st.dataframe(df_unmatched, use_container_width=True, hide_index=True)
-
-            # ── 바코드 자릿수 경고 ──
-            if all_warnings:
-                with st.expander(f"🔔 바코드 자릿수 오류 ({len(all_warnings)}건)"):
-                    for w in all_warnings:
-                        st.write(f"  • {w}")
-
-            st.divider()
-
-            # ── 엑셀 다운로드 ──
-            if matched:
-                st.subheader("4️⃣ 전산 파일 다운로드")
-                excel_bytes = create_excel_bytes(matched)
-
-                st.download_button(
-                    label="📥 전산업로드용_결과.xlsx 다운로드",
-                    data=excel_bytes,
-                    file_name="전산업로드용_결과.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True,
-                )
+            st.session_state["ocr_df"] = df
+            st.session_state["warnings"] = all_warnings
+            st.session_state["selected_mart_for_review"] = selected_mart
+            st.session_state["analysis_done"] = True
+            st.success(f"✅ {len(all_results)}개 항목 추출 완료! 아래에서 검수하세요.")
+            st.rerun()
 else:
     st.info("👆 위에서 발주서 이미지를 업로드하면 분석을 시작할 수 있습니다.")
 
+# ── 4. 검수용 편집 표 ──
+if st.session_state.get("analysis_done"):
+    st.divider()
+    st.subheader("4️⃣ 검수 및 편집")
+
+    # 경고 표시
+    warnings = st.session_state.get("warnings", [])
+    if warnings:
+        with st.expander(f"🔔 바코드 인식 경고 ({len(warnings)}건)", expanded=False):
+            for w in warnings:
+                st.write(f"  • {w}")
+
+    st.markdown(
+        "> 💡 **사용법**: 셀을 **더블클릭**하여 바코드·수량을 수정하세요. "
+        "수정 후 **'바코드 대조 갱신'** 버튼을 누르면 제품명·단가가 업데이트됩니다."
+    )
+
+    # 기준 파일 로드
+    review_mart = st.session_state.get("selected_mart_for_review", selected_mart)
+    ref_file = MART_OPTIONS[review_mart]
+    ref_dict = load_reference(ref_file)
+
+    df = st.session_state["ocr_df"].copy()
+
+    # 컬럼 순서 보장: [바코드, 수량, 제품명, 단가, 상태]
+    for col in ["바코드", "수량", "제품명", "단가", "상태"]:
+        if col not in df.columns:
+            df[col] = "" if col in ("바코드", "제품명", "상태") else 0
+    df = df[["바코드", "수량", "제품명", "단가", "상태"]]
+
+    edited_df = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=False,
+        column_config={
+            "바코드": st.column_config.TextColumn(
+                "바코드",
+                help="13자리(우선), 8자리, 12자리 숫자. 수정 가능",
+                width="medium",
+            ),
+            "수량": st.column_config.NumberColumn(
+                "수량",
+                help="주문 수량. 수정 가능",
+                min_value=0,
+                max_value=9999,
+                step=1,
+                width="small",
+            ),
+            "제품명": st.column_config.TextColumn(
+                "제품명",
+                help="마스터 파일 기준 제품명 (자동 반영)",
+                disabled=True,
+                width="large",
+            ),
+            "단가": st.column_config.NumberColumn(
+                "단가",
+                help="마스터 파일 기준 단가 (자동 반영)",
+                disabled=True,
+                width="small",
+            ),
+            "상태": st.column_config.TextColumn(
+                "상태",
+                help="마스터 파일 대조 결과",
+                disabled=True,
+                width="small",
+            ),
+        },
+        key="order_editor",
+    )
+
+    # 바코드 대조 갱신 버튼
+    if st.button("🔄 바코드 대조 갱신", use_container_width=True):
+        updated = edited_df[["바코드", "수량"]].copy()
+        updated["제품명"] = ""
+        updated["단가"] = 0
+        updated["상태"] = ""
+        updated = apply_lookup(updated, ref_dict)
+        st.session_state["ocr_df"] = updated
+        st.rerun()
+
+    # 요약 통계
+    total = len(edited_df)
+    matched = len(edited_df[edited_df["상태"] == "✅ 등록"]) if "상태" in edited_df.columns else 0
+    unmatched = len(edited_df[edited_df["상태"] == "⚠️ 미등록"]) if "상태" in edited_df.columns else 0
+    unknown = total - matched - unmatched
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📦 전체", f"{total}개")
+    c2.metric("✅ 등록", f"{matched}개")
+    c3.metric("⚠️ 미등록", f"{unmatched}개")
+    c4.metric("❓ 확인필요", f"{unknown}개")
+
+    # ── 5. 최종 확정 및 엑셀 다운로드 ──
+    st.divider()
+    st.subheader("5️⃣ 최종 확정 및 엑셀 다운로드")
+
+    if matched == 0:
+        st.warning("⚠️ 등록된 항목이 없습니다. 바코드를 확인해 주세요.")
+
+    st.info(
+        f"✅ **{matched}개** 등록 항목이 엑셀에 포함됩니다."
+        + (f" ⚠️ **{unmatched}개** 미등록 항목은 제외됩니다." if unmatched > 0 else "")
+    )
+
+    if st.button(
+        "📥 최종 확정 및 엑셀 다운로드",
+        type="primary",
+        use_container_width=True,
+        disabled=(matched == 0),
+    ):
+        excel_bytes, count = create_excel_bytes(edited_df, ref_dict)
+        st.session_state["excel_bytes"] = excel_bytes
+        st.session_state["excel_count"] = count
+        st.success(f"✅ 전산 엑셀 생성 완료! ({count}개 품목)")
+
+    if st.session_state.get("excel_bytes"):
+        st.download_button(
+            label=f"💾 전산업로드용_결과.xlsx 다운로드 ({st.session_state.get('excel_count', 0)}개 품목)",
+            data=st.session_state["excel_bytes"],
+            file_name="전산업로드용_결과.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    # 초기화
+    st.divider()
+    if st.button("🗑️ 분석 결과 초기화 (새로 시작)", use_container_width=True):
+        for key in ["ocr_df", "warnings", "analysis_done", "excel_bytes",
+                     "excel_count", "selected_mart_for_review"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
 # 푸터
 st.markdown("---")
-st.caption("발주서 자동화 v2.0 | Gemini AI 기반 바코드 인식")
+st.caption("발주서 자동화 v4.0 | Gemini AI 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
