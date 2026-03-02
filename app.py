@@ -73,28 +73,104 @@ def load_reference(ref_filename: str) -> dict:
     return ref_dict
 
 
+def fix_14digit_barcode(barcode: str) -> str:
+    """14자리 바코드에서 중복 숫자 패턴을 제거하여 13자리로 변환"""
+    if len(barcode) != 14 or not barcode.isdigit():
+        return barcode
+
+    # 연속 3개 동일 숫자 패턴 (999, 000, 111 등) 중 하나를 제거
+    for i in range(len(barcode) - 2):
+        if barcode[i] == barcode[i + 1] == barcode[i + 2]:
+            # 중복 숫자 하나 제거하여 13자리로
+            candidate = barcode[:i] + barcode[i + 1:]
+            if len(candidate) == 13:
+                return candidate
+
+    # 연속 2개 동일 숫자가 있는 위치를 찾아 하나 제거 시도
+    for i in range(len(barcode) - 1):
+        if barcode[i] == barcode[i + 1]:
+            candidate = barcode[:i] + barcode[i + 1:]
+            if len(candidate) == 13:
+                return candidate
+
+    return barcode
+
+
+def _barcode_similarity(bc1: str, bc2: str) -> int:
+    """두 바코드의 앞자리부터 일치하는 문자 수 반환 (유사도 점수)"""
+    score = 0
+    for a, b in zip(bc1, bc2):
+        if a == b:
+            score += 1
+        else:
+            break
+    return score
+
+
+def _find_by_suffix(barcode: str, ref_dict: dict) -> list:
+    """바코드 뒷자리(6~7자리) 기준으로 마스터 파일에서 후보 검색"""
+    candidates = []
+    for suffix_len in (7, 6):  # 7자리 우선, 그 다음 6자리
+        if len(barcode) < suffix_len:
+            continue
+        suffix = barcode[-suffix_len:]
+        for ref_bc in ref_dict:
+            if ref_bc.endswith(suffix):
+                candidates.append(ref_bc)
+        if candidates:
+            return candidates
+    return candidates
+
+
 def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
-    """바코드 하나를 마스터에서 조회하여 제품명, 단가, 상태 반환"""
+    """바코드 하나를 마스터에서 조회 (스마트 매칭: 정확매칭 → 14자리보정 → 뒷자리 검색)"""
     barcode = str(barcode).strip()
+
+    # 1) 정확 일치
     if barcode in ref_dict:
         info = ref_dict[barcode]
-        return {"제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 등록"}
+        return {"바코드": barcode, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 등록"}
 
-    # 유효 바코드이지만 미등록
-    if barcode.isdigit() and len(barcode) in (8, 12, 13):
-        return {"제품명": "", "단가": 0, "상태": "⚠️ 미등록"}
+    # 2) 14자리 → 13자리 자동 보정
+    if len(barcode) == 14 and barcode.isdigit():
+        fixed = fix_14digit_barcode(barcode)
+        if fixed != barcode and fixed in ref_dict:
+            info = ref_dict[fixed]
+            return {"바코드": fixed, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 자동교정"}
 
-    return {"제품명": "", "단가": 0, "상태": "❓ 바코드 확인"}
+    # 3) 뒷자리(6~7자리) 기준 유사 매칭
+    if barcode.isdigit() and len(barcode) >= 8:
+        candidates = _find_by_suffix(barcode, ref_dict)
+
+        if len(candidates) == 1:
+            # 딱 하나만 일치 → 자동 교정
+            matched_bc = candidates[0]
+            info = ref_dict[matched_bc]
+            return {"바코드": matched_bc, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 자동교정"}
+
+        elif len(candidates) > 1:
+            # 여러 개 일치 → 앞자리 유사도로 최적 선택
+            best_bc = max(candidates, key=lambda c: _barcode_similarity(barcode, c))
+            info = ref_dict[best_bc]
+            return {"바코드": best_bc, "제품명": info["제품명"], "단가": info["단가"], "상태": "✅ 자동교정"}
+
+    # 4) 유효 바코드이지만 미등록
+    if barcode.isdigit() and len(barcode) in (8, 12, 13, 14):
+        return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "⚠️ 미등록"}
+
+    return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "❓ 바코드 확인"}
 
 
 def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
-    """DataFrame 전체에 대해 바코드 기반 제품명/단가/상태를 갱신"""
-    names, prices, statuses = [], [], []
+    """데이터프레임 전체에 대해 바코드 기반 제품명/단가/상태를 갱신 (자동교정 시 바코드도 업데이트)"""
+    barcodes, names, prices, statuses = [], [], [], []
     for _, row in df.iterrows():
         result = lookup_barcode(row.get("바코드", ""), ref_dict)
+        barcodes.append(result["바코드"])
         names.append(result["제품명"])
         prices.append(result["단가"])
         statuses.append(result["상태"])
+    df["바코드"] = barcodes
     df["제품명"] = names
     df["단가"] = prices
     df["상태"] = statuses
@@ -196,8 +272,8 @@ def analyze_image(uploaded_file, max_retries=3):
                 barcode = str(item.get("barcode", "")).strip()
                 qty = item.get("qty", 0)
 
-                # 바코드 유효성: 8, 12, 13자리 숫자 허용
-                if not barcode.isdigit() or len(barcode) not in (8, 12, 13):
+                # 바코드 유효성: 8, 12, 13, 14자리 숫자 허용 (14자리는 후처리에서 자동보정)
+                if not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14):
                     warnings.append(f"'{barcode}' ({len(barcode)}자리) - {product_name}")
                     continue
 
