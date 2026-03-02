@@ -35,7 +35,7 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-MODELS = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
+MODELS = ["gemini-2.0-flash-lite-preview-02-05", "gemini-1.5-flash"]
 
 
 # ──────────────────────────────────────────────
@@ -136,10 +136,16 @@ def analyze_image(uploaded_file, max_retries=3):
 
     last_error = None
     for model_name in MODELS:
+        # google-genai SDK는 "models/" 접두사가 필요할 수 있음
+        if not model_name.startswith("models/"):
+            api_model_name = f"models/{model_name}"
+        else:
+            api_model_name = model_name
+
         for attempt in range(1, max_retries + 1):
             try:
                 response = client.models.generate_content(
-                    model=model_name,
+                    model=api_model_name,
                     contents=[prompt, img],
                 )
                 text = response.text.strip()
