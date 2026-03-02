@@ -37,7 +37,7 @@ MART_OPTIONS = {
 }
 
 # Groq 모델: llama-3.2-11b-vision-preview (이미지 분석 지원)
-GROQ_MODEL = "llama-3.2-11b-vision-preview"
+GROQ_MODEL = "llama-3.2-90b-vision-preview"
 
 
 # ──────────────────────────────────────────────
