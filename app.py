@@ -22,6 +22,7 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from google import genai
+from google.genai import types
 from PIL import Image
 
 # ──────────────────────────────────────────────
@@ -35,7 +36,7 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-MODELS = ["gemini-2.0-flash-lite-preview-02-05", "gemini-1.5-flash"]
+MODELS = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
 
 
 # ──────────────────────────────────────────────
@@ -134,19 +135,27 @@ def analyze_image(uploaded_file, max_retries=3):
 ]
 ```"""
 
+    # models/ 접두사가 붙어 있으면 제거 (google-genai SDK는 접두사 없이 전달)
+    cleaned_models = [
+        m.removeprefix("models/") for m in MODELS
+    ]
+
+    # 생성 설정 (명시적 config)
+    gen_config = types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=4096,
+    )
+
     last_error = None
-    for model_name in MODELS:
-        # google-genai SDK는 "models/" 접두사가 필요할 수 있음
-        if not model_name.startswith("models/"):
-            api_model_name = f"models/{model_name}"
-        else:
-            api_model_name = model_name
+    for model_name in cleaned_models:
+        st.write(f"🔍 모델 `{model_name}` 시도 중...")
 
         for attempt in range(1, max_retries + 1):
             try:
                 response = client.models.generate_content(
-                    model=api_model_name,
+                    model=model_name,
                     contents=[prompt, img],
+                    config=gen_config,
                 )
                 text = response.text.strip()
 
@@ -181,20 +190,43 @@ def analyze_image(uploaded_file, max_retries=3):
                         "제품명": product_name,
                     })
 
+                st.write(f"✅ 모델 `{model_name}` 분석 성공!")
                 return results, warnings
 
             except Exception as e:
                 last_error = e
-                error_msg = str(e)
-                if "429" in error_msg and attempt < max_retries:
-                    wait = 30 * attempt
-                    st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
-                    time.sleep(wait)
-                elif attempt == max_retries:
-                    # 이 모델 포기, 다음 모델 시도
-                    break
-                else:
-                    break
+                error_msg = str(e).lower()
+
+                # 404 NOT_FOUND → 이 모델은 사용 불가, 즉시 다음 모델로
+                if "404" in error_msg or "not_found" in error_msg or "not found" in error_msg:
+                    st.warning(f"⚠️ 모델 `{model_name}` 을 찾을 수 없습니다 (404). 다음 모델로 전환합니다.")
+                    break  # 재시도 없이 바로 다음 모델
+
+                # 429 Rate Limit → 대기 후 재시도
+                if "429" in error_msg or "resource_exhausted" in error_msg:
+                    if attempt < max_retries:
+                        wait = 30 * attempt
+                        st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
+                        time.sleep(wait)
+                        continue
+
+                # 500/503 서버 오류 → 잠시 대기 후 재시도
+                if ("500" in error_msg or "503" in error_msg or "unavailable" in error_msg):
+                    if attempt < max_retries:
+                        wait = 5 * attempt
+                        st.warning(f"⏳ 서버 오류. {wait}초 후 재시도... ({attempt}/{max_retries})")
+                        time.sleep(wait)
+                        continue
+
+                # 기타 에러 → 재시도 횟수 남아있으면 재시도
+                if attempt < max_retries:
+                    st.warning(f"⚠️ 오류 발생: {e}. 재시도 {attempt}/{max_retries}")
+                    time.sleep(2)
+                    continue
+
+                # 최대 재시도 초과 → 다음 모델로
+                st.warning(f"⚠️ 모델 `{model_name}` 최대 재시도 초과. 다음 모델로 전환합니다.")
+                break
 
     st.error(f"❌ 모든 모델에서 분석 실패: {last_error}")
     return [], []
