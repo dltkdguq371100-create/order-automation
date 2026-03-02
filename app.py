@@ -21,7 +21,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import openpyxl
-from google import genai
+import google.generativeai as genai
 from PIL import Image
 
 # ──────────────────────────────────────────────
@@ -43,10 +43,16 @@ MART_OPTIONS = {
 # ──────────────────────────────────────────────
 
 @st.cache_resource
-def get_genai_client():
-    """Gemini 클라이언트 (앱 전체에서 1회만 생성)"""
-    api_key = st.secrets["GEMINI_API_KEY"]
-    return genai.Client(api_key=api_key)
+def configure_genai():
+    """Gemini API 키 설정 (앱 전체에서 1회만 실행)"""
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    return True
+
+
+def get_model():
+    """Gemini 모델 인스턴스 반환"""
+    configure_genai()
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 
 @st.cache_data
@@ -102,7 +108,7 @@ def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
 
 def analyze_image(uploaded_file, max_retries=3):
     """Gemini API로 이미지에서 바코드+수량+제품명 추출 (gemini-1.5-flash 단일 모델)"""
-    client = get_genai_client()
+    model = get_model()
     img = Image.open(uploaded_file)
 
     prompt = """이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
@@ -140,10 +146,7 @@ def analyze_image(uploaded_file, max_retries=3):
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=[prompt, img],
-            )
+            response = model.generate_content([prompt, img])
             text = response.text.strip()
 
             # JSON 추출
