@@ -22,7 +22,6 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from google import genai
-from google.genai import types
 from PIL import Image
 
 # ──────────────────────────────────────────────
@@ -36,7 +35,7 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-MODELS = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
+# 안정성을 위해 gemini-1.5-flash 단일 모델 사용 (analyze_image 함수 내 직접 지정)
 
 
 # ──────────────────────────────────────────────
@@ -102,7 +101,7 @@ def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
 
 
 def analyze_image(uploaded_file, max_retries=3):
-    """Gemini API로 이미지에서 바코드+수량+제품명 추출"""
+    """Gemini API로 이미지에서 바코드+수량+제품명 추출 (gemini-1.5-flash 단일 모델)"""
     client = get_genai_client()
     img = Image.open(uploaded_file)
 
@@ -135,100 +134,68 @@ def analyze_image(uploaded_file, max_retries=3):
 ]
 ```"""
 
-    # models/ 접두사가 붙어 있으면 제거 (google-genai SDK는 접두사 없이 전달)
-    cleaned_models = [
-        m.removeprefix("models/") for m in MODELS
-    ]
-
-    # 생성 설정 (명시적 config)
-    gen_config = types.GenerateContentConfig(
-        temperature=0.1,
-        max_output_tokens=4096,
-    )
+    # ── API 호출 전 5초 대기 (할당량 초과 방지) ──
+    time.sleep(5)
 
     last_error = None
-    for model_name in cleaned_models:
-        st.write(f"🔍 모델 `{model_name}` 시도 중...")
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[prompt, img],
+            )
+            text = response.text.strip()
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, img],
-                    config=gen_config,
-                )
-                text = response.text.strip()
+            # JSON 추출
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
 
-                # JSON 추출
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0].strip()
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0].strip()
+            items = json.loads(text)
 
-                items = json.loads(text)
+            results = []
+            warnings = []
+            for item in items:
+                product_name = str(item.get("product_name", "")).strip()
+                barcode = str(item.get("barcode", "")).strip()
+                qty = item.get("qty", 0)
 
-                results = []
-                warnings = []
-                for item in items:
-                    product_name = str(item.get("product_name", "")).strip()
-                    barcode = str(item.get("barcode", "")).strip()
-                    qty = item.get("qty", 0)
-
-                    # 바코드 유효성: 8, 12, 13자리 숫자 허용
-                    if not barcode.isdigit() or len(barcode) not in (8, 12, 13):
-                        warnings.append(f"'{barcode}' ({len(barcode)}자리) - {product_name}")
-                        continue
-
-                    try:
-                        qty = int(qty)
-                    except (ValueError, TypeError):
-                        qty = 0
-
-                    results.append({
-                        "바코드": barcode,
-                        "수량": qty,
-                        "제품명": product_name,
-                    })
-
-                st.write(f"✅ 모델 `{model_name}` 분석 성공!")
-                return results, warnings
-
-            except Exception as e:
-                last_error = e
-                error_msg = str(e).lower()
-
-                # 404 NOT_FOUND → 이 모델은 사용 불가, 즉시 다음 모델로
-                if "404" in error_msg or "not_found" in error_msg or "not found" in error_msg:
-                    st.warning(f"⚠️ 모델 `{model_name}` 을 찾을 수 없습니다 (404). 다음 모델로 전환합니다.")
-                    break  # 재시도 없이 바로 다음 모델
-
-                # 429 Rate Limit → 대기 후 재시도
-                if "429" in error_msg or "resource_exhausted" in error_msg:
-                    if attempt < max_retries:
-                        wait = 30 * attempt
-                        st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
-                        time.sleep(wait)
-                        continue
-
-                # 500/503 서버 오류 → 잠시 대기 후 재시도
-                if ("500" in error_msg or "503" in error_msg or "unavailable" in error_msg):
-                    if attempt < max_retries:
-                        wait = 5 * attempt
-                        st.warning(f"⏳ 서버 오류. {wait}초 후 재시도... ({attempt}/{max_retries})")
-                        time.sleep(wait)
-                        continue
-
-                # 기타 에러 → 재시도 횟수 남아있으면 재시도
-                if attempt < max_retries:
-                    st.warning(f"⚠️ 오류 발생: {e}. 재시도 {attempt}/{max_retries}")
-                    time.sleep(2)
+                # 바코드 유효성: 8, 12, 13자리 숫자 허용
+                if not barcode.isdigit() or len(barcode) not in (8, 12, 13):
+                    warnings.append(f"'{barcode}' ({len(barcode)}자리) - {product_name}")
                     continue
 
-                # 최대 재시도 초과 → 다음 모델로
-                st.warning(f"⚠️ 모델 `{model_name}` 최대 재시도 초과. 다음 모델로 전환합니다.")
-                break
+                try:
+                    qty = int(qty)
+                except (ValueError, TypeError):
+                    qty = 0
 
-    st.error(f"❌ 모든 모델에서 분석 실패: {last_error}")
+                results.append({
+                    "바코드": barcode,
+                    "수량": qty,
+                    "제품명": product_name,
+                })
+
+            return results, warnings
+
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            if attempt < max_retries:
+                # 429 할당량 초과 → 길게 대기
+                if "429" in error_msg or "resource_exhausted" in error_msg:
+                    wait = 30 * attempt
+                    st.warning(f"⏳ API 할당량 초과. {wait}초 후 재시도... ({attempt}/{max_retries})")
+                    time.sleep(wait)
+                # 기타 에러 → 10초 대기 후 재시도
+                else:
+                    st.warning(f"⚠️ 오류 발생: {e}. 10초 후 재시도... ({attempt}/{max_retries})")
+                    time.sleep(10)
+            else:
+                st.error(f"❌ 최대 재시도 초과. 분석 실패: {last_error}")
+
     return [], []
 
 
