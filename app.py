@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-발주서 자동화 - Streamlit 웹 앱 v6.0 (Google Gemini API)
+발주서 자동화 - Streamlit 웹 앱 v7.0 (Groq API)
 
 기능:
   1. 마트 선택 (와 / 킹 / 팜) 라디오 버튼
   2. 발주서 사진 업로드 (st.file_uploader)
-  3. Google Gemini API 분석 (gemini-2.0-flash)
+  3. Groq API 분석 (llama-3.2-90b-vision-preview)
   4. st.data_editor 기반 검수 편집 [바코드, 수량, 제품명, 단가, 상태]
   5. 바코드/수량 수정 → 마스터 파일 실시간 대조
   6. 최종 확정 및 엑셀 다운로드 버튼
@@ -23,7 +23,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import openpyxl
-import google.generativeai as genai
+from groq import Groq
 from PIL import Image
 
 # ──────────────────────────────────────────────
@@ -37,8 +37,8 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-# Gemini 모델
-GEMINI_MODEL = "gemini-3-pro-preview"
+# Groq 모델
+GROQ_MODEL = "llama-3.2-90b-vision-preview"
 
 
 # ──────────────────────────────────────────────
@@ -46,17 +46,9 @@ GEMINI_MODEL = "gemini-3-pro-preview"
 # ──────────────────────────────────────────────
 
 @st.cache_resource
-def configure_gemini():
-    """Gemini API 설정 (앱 전체에서 1회만 실행)"""
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    return genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        generation_config=genai.GenerationConfig(
-            temperature=0.1,
-            max_output_tokens=8192,
-            response_mime_type="application/json",
-        ),
-    )
+def get_groq_client():
+    """Groq 클라이언트 (앱 전체에서 1회만 생성)"""
+    return Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 @st.cache_data
@@ -422,8 +414,8 @@ def get_prompt_for_mart(mart_type: str) -> str:
 
 
 def analyze_image(uploaded_file, mart_type="와", max_retries=3):
-    """Gemini API로 이미지에서 바코드+수량+제품명 추출 (마트별 맞춤형 프롬프트)"""
-    model = configure_gemini()
+    """Groq API로 이미지에서 바코드+수량+제품명 추출 (마트별 맞춤형 프롬프트)"""
+    client = get_groq_client()
 
     # ── 최대 해상도 유지: 원본 바이트를 그대로 Base64 인코딩 ──
     uploaded_file.seek(0)
@@ -434,14 +426,6 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
     fname = uploaded_file.name.lower()
     mime_type = "image/png" if fname.endswith(".png") else "image/jpeg"
 
-    # inline_data 파트 (해상도 축소 없이 원본 전송)
-    image_part = {
-        "inline_data": {
-            "mime_type": mime_type,
-            "data": img_base64,
-        }
-    }
-
     # 마트별 맞춤형 프롬프트 사용
     prompt = get_prompt_for_mart(mart_type)
 
@@ -451,8 +435,27 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = model.generate_content([prompt, image_part])
-            text = response.text.strip()
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{img_base64}",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+            )
+            text = response.choices[0].message.content.strip()
 
             # JSON 추출 (코드블록 래핑 제거)
             if "```json" in text:
@@ -797,4 +800,4 @@ if st.session_state.get("analysis_done"):
 
 # 푸터
 st.markdown("---")
-st.caption("발주서 자동화 v6.0 | Google Gemini AI 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
+st.caption("발주서 자동화 v7.0 | Groq AI (Llama Vision) 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
