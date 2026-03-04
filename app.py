@@ -328,7 +328,9 @@ def get_prompt_for_mart(mart_type: str) -> str:
 - 모든 문자열 값은 깨끗하게, 제어 문자 없이 작성하세요.
 - 표의 첫 행부터 마지막 행까지 빠짐없이 모두 추출하세요. 행을 건너뛰지 마세요.
 
-{"items": [{"product_name": "제품명", "barcode": "8801234567890", "qty": 3}]}"""
+{"items": [{"product_name": "제품명", "barcode": "8801234567890", "qty": 3}]}
+
+결과는 반드시 JSON 형식으로만 출력해줘."""
 
     if mart_type == "킹":
         return role_section + """
