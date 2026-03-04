@@ -143,7 +143,38 @@ def _find_by_suffix(barcode: str, ref_dict: dict) -> list:
     return candidates
 
 
-def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
+def lookup_by_product_name(product_name: str, ref_dict: dict) -> dict | None:
+    """품목명 키워드로 마스터 파일에서 바코드를 역으로 찾는 함수"""
+    if not product_name or len(product_name.strip()) < 2:
+        return None
+
+    name_clean = product_name.strip().lower()
+    best_match = None
+    best_score = 0
+
+    for ref_bc, info in ref_dict.items():
+        ref_name = info["제품명"].lower()
+        # 키워드 매칭: 품목명의 각 단어가 마스터 제품명에 포함되는지 확인
+        keywords = [w for w in name_clean.split() if len(w) >= 2]
+        if not keywords:
+            continue
+        matched = sum(1 for kw in keywords if kw in ref_name)
+        score = matched / len(keywords) if keywords else 0
+
+        # 최소 50% 이상 키워드 일치 시 후보
+        if score > best_score and score >= 0.5:
+            best_score = score
+            best_match = {
+                "바코드": ref_bc,
+                "제품명": info["제품명"],
+                "단가": info["단가"],
+                "점수": best_score,
+            }
+
+    return best_match
+
+
+def lookup_barcode(barcode: str, ref_dict: dict, product_name: str = "") -> dict:
     """바코드 하나를 마스터에서 조회 (스마트 매칭: 정확매칭 → 14자리보정 → 뒷자리 검색)"""
     # 철저한 전처리: str 변환 + strip + 소수점 제거
     barcode = str(barcode).strip()
@@ -184,6 +215,14 @@ def lookup_barcode(barcode: str, ref_dict: dict) -> dict:
         return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "⚠️ 미등록"}
 
     print(f"[DEBUG 확인필요] AI값='{barcode}' (길이:{len(barcode)}, 숫자여부:{barcode.isdigit()})")
+
+    # 5) 품목명 기반 역방향 바코드 매칭 (바코드가 13자리가 아니거나 미등록일 때)
+    if product_name:
+        name_match = lookup_by_product_name(product_name, ref_dict)
+        if name_match:
+            print(f"[DEBUG 품목명매칭] '{product_name}' → '{name_match['제품명']}' (BC:{name_match['바코드']}, 점수:{name_match['점수']:.1%})")
+            return {"바코드": name_match["바코드"], "제품명": name_match["제품명"], "단가": name_match["단가"], "상태": "✅ 품명매칭"}
+
     return {"바코드": barcode, "제품명": "", "단가": 0, "상태": "❓ 바코드 확인"}
 
 
@@ -191,7 +230,8 @@ def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
     """데이터프레임 전체에 대해 바코드 기반 제품명/단가/상태를 갱신 (자동교정 시 바코드도 업데이트)"""
     barcodes, names, prices, statuses = [], [], [], []
     for _, row in df.iterrows():
-        result = lookup_barcode(row.get("바코드", ""), ref_dict)
+        product_name = str(row.get("제품명", "")).strip()
+        result = lookup_barcode(row.get("바코드", ""), ref_dict, product_name=product_name)
         barcodes.append(result["바코드"])
         names.append(result["제품명"])
         prices.append(result["단가"])
@@ -248,8 +288,117 @@ def regex_fallback_parse(text: str) -> list:
     return items
 
 
-def analyze_image(uploaded_file, max_retries=3):
-    """Gemini API로 이미지에서 바코드+수량+제품명 추출"""
+def get_prompt_for_mart(mart_type: str) -> str:
+    """마트별 맞춤형 프롬프트 반환"""
+
+    # 공통 역할 및 응답 형식
+    role_section = """[역할]
+너는 숙련된 물류 센터의 데이터 입력 전문가야. 이미지의 모든 행을 하나도 빠짐없이, 아주 작은 글씨까지 정밀하게 읽어야 해.
+
+[공간 인식 - 매우 중요]
+- 먼저 표의 헤더 행(열 제목)을 찾으세요.
+- 각 열 제목의 수평 위치(x 좌표)를 파악하세요.
+- 데이터를 읽을 때는, 해당 열 제목의 수직 아래에 있는 데이터만 추출하세요.
+- 행(Row)을 읽을 때는 수평으로 같은 y 좌표의 셀들을 매칭하세요."""
+
+    response_section = """
+[응답 형식 - 반드시 준수]
+- 반드시 아래 형식의 순수 JSON 객체로만 응답하세요.
+- 마크다운, 설명, 주석은 절대 포함하지 마세요.
+- product_name 값 안에 큰따옴표(")를 절대 사용하지 마세요. 필요 시 작은따옴표(')로 대체하세요.
+- 모든 문자열 값은 깨끗하게, 제어 문자 없이 작성하세요.
+- 표의 첫 행부터 마지막 행까지 빠짐없이 모두 추출하세요. 행을 건너뛰지 마세요.
+
+{"items": [{"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3}, {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}]}"""
+
+    if mart_type == "킹":
+        return role_section + """
+
+[작업]
+이 **킹마트** 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
+
+[킹마트 표 구조 - 필수 확인]
+- 바코드는 **4번째 열**에 있습니다.
+- 발주량(수량)은 **5번째 열**에 있습니다.
+- 제품명은 바코드 열 좌측에 있습니다.
+- 각 행에서 제품명, 바코드, 수량을 수평으로 정확히 매칭하세요.
+
+[킹마트 수량 읽기 - 극히 중요]
+- 수량 칸에 **볼펜으로 동그라미(○)**가 쳐져 있는 경우가 많습니다.
+- 동그라미, 원, 낙서 등 수기 표시는 완전히 무시하세요.
+- 동그라미 안에 있는 **숫자만** 정확히 읽으세요.
+- 동그라미를 숫자 0으로 오인하여 수량을 10배로 부풀리지 마세요.
+- 예시: 동그라미 안에 '3' → 수량은 3 (× 30이 아님)
+
+[바코드 식별 규칙]
+- 880으로 시작하면 한국 바코드 (가장 흔함)
+- 489로 시작하면 홍콩 바코드
+- 693으로 시작하면 중국 바코드
+- 13자리 숫자를 최우선으로 바코드로 인식하세요.
+- 8자리 또는 12자리 숫자 코드도 바코드로 허용합니다.
+- 바코드가 확실하지 않으면, 바로 옆의 품목명을 반드시 정확히 읽어주세요.
+
+[수량 규칙]
+- 수량은 보통 1~999 범위의 작은 정수입니다.
+- 단가나 금액과 혼동하지 마세요."""
+        + response_section
+
+    elif mart_type == "팜":
+        return role_section + """
+
+[작업]
+이 **팜마트** 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
+
+[팜마트 표 구조 - 필수 확인]
+- **'코드' 열이 바코드입니다.** '코드' 열은 **2번째 열**에 있습니다.
+- 발주량(수량)은 **5번째 열**에 있습니다.
+- 품목명은 코드(바코드) 열 바로 옆에 있습니다.
+
+[팜마트 특별 주의]
+- 표의 선(Line)이 복잡하므로 행(Row)이 섞이지 않도록 주의하세요.
+- 각 행에서 바코드와 품목명을 **수평으로(같은 y 좌표)** 정확히 매칭하세요.
+- 바코드 숫자가 표의 선 때문에 잘 안 보일 때는, 바로 옆의 **품목명을 정확히 읽어주세요** (품목명으로 대조 가능).
+- 바코드가 불명확할 때 product_name을 정확히 적는 것이 매우 중요합니다.
+
+[바코드 식별 규칙]
+- 880으로 시작하면 한국 바코드 (가장 흔함)
+- 489로 시작하면 홍콩 바코드
+- 693으로 시작하면 중국 바코드
+- 13자리 숫자를 최우선으로 바코드로 인식하세요.
+- 8자리 또는 12자리 숫자 코드도 바코드로 허용합니다.
+
+[수량 규칙]
+- 수량은 보통 1~999 범위의 작은 정수입니다.
+- 단가나 금액과 혼동하지 마세요."""
+        + response_section
+
+    else:  # 와마트 (기본)
+        return role_section + """
+
+[작업]
+이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
+
+[표 구조 분석 규칙]
+- 발주서 표는 일반적으로 [번호, 제품명/규격, 바코드, 수량, 단가, 금액] 열로 구성됩니다.
+- 각 행에서 제품명, 바코드, 수량을 정확히 한 줄로 매칭하세요.
+- 절대로 단가(원), 금액(원), 합계 등 다른 숫자 열을 바코드로 혼동하지 마세요.
+
+[바코드 식별 규칙 - 매우 중요]
+- 880으로 시작하면 한국 바코드 (가장 흔함)
+- 489로 시작하면 홍콩 바코드
+- 693으로 시작하면 중국 바코드
+- 위 접두사로 시작하는 13자리 숫자를 최우선으로 바코드로 인식하세요.
+- 13자리가 아니더라도, 8자리 또는 12자리 숫자 코드도 바코드로 허용합니다.
+- 4~5자리 숫자는 단가, 5~7자리 숫자는 금액일 가능성이 높으니 바코드와 구별하세요.
+
+[수량 규칙]
+- 수량은 보통 1~999 범위의 작은 정수입니다.
+- 단가나 금액과 혼동하지 마세요."""
+        + response_section
+
+
+def analyze_image(uploaded_file, mart_type="와", max_retries=3):
+    """Gemini API로 이미지에서 바코드+수량+제품명 추출 (마트별 맞춤형 프롬프트)"""
     model = configure_gemini()
 
     # ── 최대 해상도 유지: 원본 바이트를 그대로 Base64 인코딩 ──
@@ -269,37 +418,8 @@ def analyze_image(uploaded_file, max_retries=3):
         }
     }
 
-    prompt = """[역할]
-너는 숙련된 물류 센터의 데이터 입력 전문가야. 이미지의 모든 행을 하나도 빠짐없이, 아주 작은 글씨까지 정밀하게 읽어야 해.
-
-[작업]
-이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
-
-[표 구조 분석 규칙]
-- 발주서 표는 일반적으로 [번호, 제품명/규격, 바코드, 수량, 단가, 금액] 열로 구성됩니다.
-- 각 행에서 제품명, 바코드, 수량을 정확히 한 줄로 매칭하세요.
-- 절대로 단가(원), 금액(원), 합계 등 다른 숫자 열을 바코드로 혼동하지 마세요.
-- 표의 첫 행부터 마지막 행까지 빠짐없이 모두 추출하세요. 행을 건너뛰지 마세요.
-
-[바코드 식별 규칙 - 매우 중요]
-- 880으로 시작하면 한국 바코드 (가장 흔함)
-- 489로 시작하면 홍콩 바코드
-- 693으로 시작하면 중국 바코드
-- 위 접두사로 시작하는 13자리 숫자를 최우선으로 바코드로 인식하세요.
-- 13자리가 아니더라도, 8자리 또는 12자리 숫자 코드도 바코드로 허용합니다.
-- 4~5자리 숫자는 단가, 5~7자리 숫자는 금액일 가능성이 높으니 바코드와 구별하세요.
-
-[수량 규칙]
-- 수량은 보통 1~999 범위의 작은 정수입니다.
-- 단가나 금액과 혼동하지 마세요.
-
-[응답 형식 - 반드시 준수]
-- 반드시 아래 형식의 순수 JSON 객체로만 응답하세요.
-- 마크다운, 설명, 주석은 절대 포함하지 마세요.
-- product_name 값 안에 큰따옴표(")를 절대 사용하지 마세요. 필요 시 작은따옴표(')로 대체하세요.
-- 모든 문자열 값은 깨끗하게, 제어 문자 없이 작성하세요.
-
-{"items": [{"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3}, {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}]}"""
+    # 마트별 맞춤형 프롬프트 사용
+    prompt = get_prompt_for_mart(mart_type)
 
     # ── API 호출 전 2초 대기 (할당량 초과 방지) ──
     time.sleep(2)
@@ -488,7 +608,7 @@ if uploaded_files:
                 text=f"🔄 '{f.name}' 분석 중... ({i + 1}/{len(uploaded_files)})",
             )
             f.seek(0)
-            results, warnings = analyze_image(f)
+            results, warnings = analyze_image(f, mart_type=selected_mart)
             all_results.extend(results)
             all_warnings.extend(warnings)
 
