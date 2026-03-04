@@ -37,8 +37,13 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-# Groq 모델
-GROQ_MODEL = "llama-3.2-90b-vision-preview"
+# Groq 모델 (순서대로 시도: 첫 번째가 실패하면 다음 모델로 폴백)
+GROQ_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "meta-llama/Llama-3.2-11B-Vision-Instruct",
+    "meta-llama/Llama-3.2-90B-Vision-Instruct",
+]
+GROQ_MODEL = GROQ_MODELS[0]
 
 
 # ──────────────────────────────────────────────
