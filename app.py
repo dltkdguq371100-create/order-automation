@@ -2,8 +2,9 @@
 """
 발주서 자동화 - Streamlit 웹 앱 (Groq API 최적화)
 - 만능 JSON 파서 적용 (키 이름 무관하게 배열 추출)
-- Llama 바코드 환각 방지 프롬프트 적용
-- 품목명 역방향 매칭 강화 (바코드 오류 보완)
+- 무한 루프 물리적 차단 (연속 중복 제거 로직 추가)
+- AI 행 번호(row_num) 강제 부여로 루프 방지
+- 킹마트 바코드 환각 포기 및 제품명 100% 의존 전략
 """
 
 import io
@@ -122,8 +123,8 @@ def lookup_by_product_name(product_name: str, ref_dict: dict) -> dict | None:
         matched = sum(1 for kw in keywords if kw in ref_name)
         score = matched / len(keywords)
 
-        # 40% 이상만 일치해도 후보로 올려줌
-        if score > best_score and score >= 0.4:
+        # 35% 이상만 일치해도 후보로 올려줌 (킹마트 환각 대응을 위해 조건 완화)
+        if score > best_score and score >= 0.35:
             best_score = score
             best_match = {
                 "바코드": ref_bc,
@@ -159,7 +160,7 @@ def lookup_barcode(barcode: str, ref_dict: dict, product_name: str = "") -> dict
             best_bc = max(candidates, key=lambda c: _barcode_similarity(barcode, c))
             return {"바코드": best_bc, "제품명": ref_dict[best_bc]["제품명"], "단가": ref_dict[best_bc]["단가"], "상태": "✅ 자동교정"}
 
-    # 4) 역방향 매칭 (바코드 실패 시 제품명으로 유추)
+    # 4) 역방향 매칭 (바코드가 틀렸거나 없을 때 제품명으로 강력하게 유추)
     if product_name:
         name_match = lookup_by_product_name(product_name, ref_dict)
         if name_match:
@@ -190,17 +191,17 @@ def sanitize_json_text(text: str) -> str:
 def get_prompt_for_mart(mart_type: str) -> str:
     role_section = """[역할]
 너는 물류 센터의 데이터 입력 전문가야. 표의 모든 행을 빠짐없이 정확하게 읽어야 해.
-반드시 아래 형식의 순수 JSON 객체로만 응답해. 부연 설명은 절대 하지 마.
-{"items": [{"product_name": "상품명 규격", "barcode": "8801234567890", "qty": 3}]}
+반드시 아래 형식의 순수 JSON 객체로만 응답해. 무한 반복 에러를 막기 위해 "row_num"을 반드시 순서대로 부여해!
+{"items": [{"row_num": 1, "product_name": "상품명 규격", "barcode": "8801234567890", "qty": 3}]}
 """
     if mart_type == "킹":
         return role_section + """
-[킹마트 발주서 분석 지침 - 엄격한 규칙]
-1. 행(Row) 처리: 표의 위에서 아래로 한 줄씩 순서대로 읽으세요. 이미 읽은 행을 반복해서 출력하지 마세요! (무한 반복 생성 절대 금지)
-2. 바코드(4열): 화면에 보이는 13자리 숫자만 있는 그대로 연속해서 적으세요. (예: "8801234567890"). 절대 임의로 숫자를 지어내거나 기호를 넣지 마세요.
-3. 발주량(5열): 수량 칸에 수기로 그려진 큰 동그라미(O)는 숫자 '0'이 아닙니다. 동그라미 안의 실제 숫자(예: 1, 2, 3)만 정확히 적으세요.
-4. 상품명(2열, 3열 보완): 2열의 상품명과 3열의 규격을 공백으로 이어붙여서 `product_name`에 적어주세요.
-5. 종료 조건(매우 중요): 문서의 마지막 행(품목)을 읽은 후에는 즉시 데이터를 그만 추출하고 JSON 배열을 닫으세요. 표가 끝났는데도 존재하지 않는 품목을 계속 상상해서 덧붙이면 절대 안 됩니다.
+[킹마트 발주서 분석 지침 - 무한반복 및 환각 절대 금지 규칙]
+1. (핵심) 바코드가 흐리거나 13자리가 아니면 절대로 지어내지 마! 추측해서 이상한 숫자(예: 8801055...)를 만들 바에는 차라리 "barcode": "" 로 완전히 비워둬.
+2. 바코드를 포기하는 대신, 2열(상품명)과 3열(규격)을 합쳐서 "product_name"에 한 글자도 틀리지 않게 똑같이 적어. 여기에 사활을 걸어라.
+3. 수량 칸의 볼펜 동그라미는 무시하고 실제 적힌 작은 숫자만 추출해.
+4. 행을 읽을 때마다 "row_num": 1, 2, 3... 순서대로 번호를 매겨. 이미 적은 내용을 반복해서 출력하는 무한 루프에 빠지면 안 돼.
+5. 표의 마지막 품목을 읽었으면 즉시 추출을 멈추고 JSON을 닫아라.
 """
     elif mart_type == "팜":
         return role_section + """
@@ -216,11 +217,10 @@ def get_prompt_for_mart(mart_type: str) -> str:
 """
 
 def extract_list_from_json(parsed_data):
-    """(핵심!) JSON 안에 어떤 키 이름(orders, items, data 등)으로 들어있든 배열을 강제로 찾아내는 만능 함수"""
     if isinstance(parsed_data, list):
         return parsed_data
     if isinstance(parsed_data, dict):
-        for key in ["items", "orders", "order_items", "data"]:
+        for key in ["items", "orders", "order_items", "data", "rows"]:
             if key in parsed_data and isinstance(parsed_data[key], list):
                 return parsed_data[key]
         for key, value in parsed_data.items():
@@ -234,7 +234,6 @@ def analyze_image(uploaded_file, mart_type="와"):
     img_base64 = base64.b64encode(uploaded_file.read()).decode("utf-8")
     mime_type = "image/png" if uploaded_file.name.lower().endswith(".png") else "image/jpeg"
 
-    # API 필수 규칙: JSON이라는 단어가 프롬프트 끝에 있어야 함
     prompt = get_prompt_for_mart(mart_type) + "\n\nPlease output in JSON format."
 
     try:
@@ -255,7 +254,6 @@ def analyze_image(uploaded_file, mart_type="와"):
         )
         text = response.choices[0].message.content.strip()
 
-        # 끊겼던 부분 정상 복구
         if "```json" in text: 
             text = text.split("```json")[1].split("```")[0].strip()
         elif "```" in text: 
@@ -264,30 +262,35 @@ def analyze_image(uploaded_file, mart_type="와"):
         text = sanitize_json_text(text)
         parsed = json.loads(text)
 
-        # ✅ 만능 파서로 배열 강제 추출
         items = extract_list_from_json(parsed)
 
         results = []
         warnings = []
+        prev_hash = "" # 무한루프 물리적 차단을 위한 변수
+
         for item in items:
-            # 키 이름이 무엇이든 유연하게 대처 (name, code, quantity 등)
             product_name = str(item.get("product_name", item.get("name", ""))).strip()
             barcode = str(item.get("barcode", item.get("product_code", item.get("code", "")))).strip()
             raw_qty = item.get("qty", item.get("quantity", item.get("amount", 0)))
 
-            # AI가 삽입한 하이픈과 기존 공백을 모두 제거하여 순수 숫자로 만듦
             barcode = barcode.replace(" ", "").replace("-", "")
 
             # 바코드와 제품명이 둘 다 없으면 패스
             if not barcode and not product_name: continue 
 
-            if barcode and (not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14)):
-                warnings.append(f"형식 의심: '{barcode}' - {product_name}")
-
             try:
                 qty = int(str(raw_qty).replace(",", ""))
             except:
                 qty = 0
+
+            # ✅ 무한 루프 물리적 차단 로직 (바로 앞의 데이터와 완전히 똑같으면 버림)
+            current_hash = f"{barcode}_{product_name}_{qty}"
+            if current_hash == prev_hash:
+                continue # 연속 중복 발생 시 건너뜀 (루프 방지)
+            prev_hash = current_hash
+
+            if barcode and (not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14)):
+                warnings.append(f"형식 의심: '{barcode}' - {product_name}")
 
             results.append({"바코드": barcode, "수량": qty, "제품명": product_name})
 
