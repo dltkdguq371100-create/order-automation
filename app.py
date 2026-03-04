@@ -37,7 +37,7 @@ MART_OPTIONS = {
 }
 
 # Gemini 모델
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3-pro-preview"
 
 
 # ──────────────────────────────────────────────
@@ -628,3 +628,4 @@ if st.session_state.get("analysis_done"):
 # 푸터
 st.markdown("---")
 st.caption("발주서 자동화 v6.0 | Google Gemini AI 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
+
