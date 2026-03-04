@@ -433,6 +433,8 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
 
     # 마트별 맞춤형 프롬프트 사용
     prompt = get_prompt_for_mart(mart_type)
+    # Groq json_object 모드 필수: 프롬프트에 JSON 출력 지시를 명시해야 함
+    prompt += "\n\nPlease output in JSON format."
 
     # ── API 호출 전 2초 대기 (할당량 초과 방지) ──
     time.sleep(2)
