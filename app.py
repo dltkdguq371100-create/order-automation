@@ -499,35 +499,41 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
                         raise json_err
                     parsed = {"items": items}
 
-            # {"items": [...]} 형태 또는 직접 배열 [...] 둘 다 지원
+            # AI가 'items' 대신 'orders' 배열로 응답할 경우를 대비하여 유연하게 추출
             if isinstance(parsed, dict):
-                items = parsed.get("items", [])
+                items = parsed.get("items", parsed.get("orders", []))
             else:
                 items = parsed
 
             results = []
             warnings = []
             for item in items:
-                product_name = str(item.get("product_name", "")).strip()
-                barcode = str(item.get("barcode", "")).strip()
-                qty = item.get("qty", 0)
-
-                # 1차 전처리: 바코드 내부 공백이나 하이픈 제거
+                # 키 이름이 product_name이 아닐 경우를 대비
+                product_name = str(item.get("product_name", item.get("name", ""))).strip()
+                
+                # 키 이름이 barcode가 아니라 product_code나 code일 경우를 대비
+                barcode = str(item.get("barcode", item.get("product_code", item.get("code", "")))).strip()
+                
+                # 키 이름이 qty가 아니라 quantity일 경우를 대비
+                raw_qty = item.get("qty", item.get("quantity", 0))
+                
+                # 바코드 내부의 공백이나 하이픈 등 불순물 1차 제거
                 barcode = barcode.replace(" ", "").replace("-", "")
-
-                # 바코드와 제품명이 둘 다 완전히 비어있을 때만 버림
+                
+                # 바코드와 제품명이 둘 다 텅 비어있을 때만 버림
                 if not barcode and not product_name:
-                    continue
-
+                    continue 
+                
                 # 바코드 형식이 이상하더라도 데이터는 살려두고 경고만 띄움
                 if barcode and (not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14)):
-                    warnings.append(f"바코드 형식 확인필요: '{barcode}' - {product_name}")
-
+                    warnings.append(f"바코드 형식 의심 (수동 확인 필요): '{barcode}' - {product_name}")
+                
+                # 수량 형변환 안전 처리
                 try:
-                    qty = int(qty)
+                    qty = int(str(raw_qty).replace(",", "")) # 콤마가 섞여 들어올 경우 제거
                 except (ValueError, TypeError):
                     qty = 0
-
+                
                 results.append({
                     "바코드": barcode,
                     "수량": qty,
