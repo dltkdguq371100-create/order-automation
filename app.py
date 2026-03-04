@@ -17,6 +17,7 @@ import io
 import json
 import re
 import time
+import base64
 from pathlib import Path
 
 import streamlit as st
@@ -251,16 +252,34 @@ def analyze_image(uploaded_file, max_retries=3):
     """Gemini API로 이미지에서 바코드+수량+제품명 추출"""
     model = configure_gemini()
 
-    # PIL Image로 변환 (Gemini는 PIL Image를 직접 지원)
+    # ── 최대 해상도 유지: 원본 바이트를 그대로 Base64 인코딩 ──
     uploaded_file.seek(0)
-    img = Image.open(uploaded_file)
+    raw_bytes = uploaded_file.read()
+    img_base64 = base64.b64encode(raw_bytes).decode("utf-8")
 
-    prompt = """이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
+    # MIME 타입 결정
+    fname = uploaded_file.name.lower()
+    mime_type = "image/png" if fname.endswith(".png") else "image/jpeg"
+
+    # inline_data 파트 (해상도 축소 없이 원본 전송)
+    image_part = {
+        "inline_data": {
+            "mime_type": mime_type,
+            "data": img_base64,
+        }
+    }
+
+    prompt = """[역할]
+너는 숙련된 물류 센터의 데이터 입력 전문가야. 이미지의 모든 행을 하나도 빠짐없이, 아주 작은 글씨까지 정밀하게 읽어야 해.
+
+[작업]
+이 발주서 이미지를 정밀하게 분석하여 모든 주문 항목을 추출하세요.
 
 [표 구조 분석 규칙]
 - 발주서 표는 일반적으로 [번호, 제품명/규격, 바코드, 수량, 단가, 금액] 열로 구성됩니다.
 - 각 행에서 제품명, 바코드, 수량을 정확히 한 줄로 매칭하세요.
 - 절대로 단가(원), 금액(원), 합계 등 다른 숫자 열을 바코드로 혼동하지 마세요.
+- 표의 첫 행부터 마지막 행까지 빠짐없이 모두 추출하세요. 행을 건너뛰지 마세요.
 
 [바코드 식별 규칙 - 매우 중요]
 - 880으로 시작하면 한국 바코드 (가장 흔함)
@@ -288,7 +307,7 @@ def analyze_image(uploaded_file, max_retries=3):
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = model.generate_content([prompt, img])
+            response = model.generate_content([prompt, image_part])
             text = response.text.strip()
 
             # JSON 추출 (코드블록 래핑 제거)
@@ -628,4 +647,3 @@ if st.session_state.get("analysis_done"):
 # 푸터
 st.markdown("---")
 st.caption("발주서 자동화 v6.0 | Google Gemini AI 바코드 인식 + 수동 검수 + 전산 엑셀 생성")
-
