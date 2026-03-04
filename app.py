@@ -53,7 +53,7 @@ def configure_gemini():
         model_name=GEMINI_MODEL,
         generation_config=genai.GenerationConfig(
             temperature=0.1,
-            max_output_tokens=4096,
+            max_output_tokens=8192,
             response_mime_type="application/json",
         ),
     )
@@ -288,6 +288,29 @@ def regex_fallback_parse(text: str) -> list:
     return items
 
 
+def repair_truncated_json(text: str) -> str:
+    """잘린 JSON을 복구: 마지막 완전한 항목까지만 살리고 닫는 괄호 보충"""
+    # 마지막 완전한 객체(}를 찾아 그 이후 불완전한 데이터 제거)
+    last_complete = text.rfind("}")
+    if last_complete == -1:
+        return text
+
+    text = text[:last_complete + 1]
+
+    # 닫는 괄호/대괄호 보충
+    open_braces = text.count("{") - text.count("}")
+    open_brackets = text.count("[") - text.count("]")
+
+    # 후행 쉼표 제거
+    text = re.sub(r',\s*$', '', text)
+
+    # 부족한 괄호 보충
+    text += "]" * max(open_brackets, 0)
+    text += "}" * max(open_braces, 0)
+
+    return text
+
+
 def get_prompt_for_mart(mart_type: str) -> str:
     """마트별 맞춤형 프롬프트 반환"""
 
@@ -303,13 +326,14 @@ def get_prompt_for_mart(mart_type: str) -> str:
 
     response_section = """
 [응답 형식 - 반드시 준수]
-- 반드시 아래 형식의 순수 JSON 객체로만 응답하세요.
-- 마크다운, 설명, 주석은 절대 포함하지 마세요.
+- 반드시 아래 형식의 순수 JSON 객체로만 응답하세요. 불필요한 설명, 마크다운, 주석은 절대 포함하지 마세요.
+- 오직 JSON 데이터만 대답하세요. 데이터 외에 단 한 글자도 추가하지 마세요.
+- product_name은 최대 20자 이내로 간결하게 작성하세요. 기규/상세 설명은 생략하세요.
 - product_name 값 안에 큰따옴표(")를 절대 사용하지 마세요. 필요 시 작은따옴표(')로 대체하세요.
 - 모든 문자열 값은 깨끗하게, 제어 문자 없이 작성하세요.
 - 표의 첫 행부터 마지막 행까지 빠짐없이 모두 추출하세요. 행을 건너뛰지 마세요.
 
-{"items": [{"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3}, {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}]}"""
+{"items": [{"product_name": "제품명", "barcode": "8801234567890", "qty": 3}]}"""
 
     if mart_type == "킹":
         return role_section + """
@@ -439,20 +463,27 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
             # JSON 정화: 제어 문자·불량 따옴표·후행 쉼표 처리
             text = sanitize_json_text(text)
 
-            # JSON 파싱 시도 → 실패 시 정규식 백업
+            # JSON 파싱 시도 → 실패 시 잘림 복구 → 정규식 백업
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError as json_err:
                 print(f"[WARN] JSON 파싱 실패: {json_err}")
                 print(f"[WARN] 원본 텍스트(앞 500자): {text[:500]}")
-                # 정규식 백업 파싱
-                items = regex_fallback_parse(text)
-                if items:
-                    st.warning(f"⚠️ JSON 파싱 오류 발생 → 정규식으로 {len(items)}개 항목 복구")
-                else:
-                    st.error("❌ JSON 파싱 및 정규식 백업 모두 실패")
-                    raise json_err
-                parsed = {"items": items}
+
+                # 1차 복구: 잘림 복구 (닫는 괄호 보충)
+                repaired = repair_truncated_json(text)
+                try:
+                    parsed = json.loads(repaired)
+                    st.warning("⚠️ JSON이 잘려서 닫는 괄호를 보충하여 복구했습니다.")
+                except json.JSONDecodeError:
+                    # 2차 복구: 정규식 백업 파싱
+                    items = regex_fallback_parse(text)
+                    if items:
+                        st.warning(f"⚠️ JSON 파싱 오류 발생 → 정규식으로 {len(items)}개 항목 복구")
+                    else:
+                        st.error("❌ JSON 파싱, 잘림 복구, 정규식 백업 모두 실패")
+                        raise json_err
+                    parsed = {"items": items}
 
             # {"items": [...]} 형태 또는 직접 배열 [...] 둘 다 지원
             if isinstance(parsed, dict):
