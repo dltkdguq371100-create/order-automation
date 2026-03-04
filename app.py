@@ -5,7 +5,7 @@
 기능:
   1. 마트 선택 (와 / 킹 / 팜) 라디오 버튼
   2. 발주서 사진 업로드 (st.file_uploader)
-  3. Groq API 분석 (llama-3.2-90b-vision-instruct)
+  3. Groq API 분석 (meta-llama/llama-4-scout-17b-16e-instruct)
   4. st.data_editor 기반 검수 편집 [바코드, 수량, 제품명, 단가, 상태]
   5. 바코드/수량 수정 → 마스터 파일 실시간 대조
   6. 최종 확정 및 엑셀 다운로드 버튼
@@ -37,10 +37,9 @@ MART_OPTIONS = {
     "팜": "기준_팜.xlsx",
 }
 
-# Groq 모델 (순서대로 시도: 첫 번째가 실패하면 다음 모델로 폴백)
+# Groq 모델
 GROQ_MODELS = [
-    "llama-3.2-90b-vision-instruct",
-    "llama-3.2-11b-vision-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
 GROQ_MODEL = GROQ_MODELS[0]
 
