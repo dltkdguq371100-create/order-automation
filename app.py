@@ -508,10 +508,16 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
                 barcode = str(item.get("barcode", "")).strip()
                 qty = item.get("qty", 0)
 
-                # 바코드 유효성: 8, 12, 13, 14자리 숫자 허용 (14자리는 후처리에서 자동보정)
-                if not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14):
-                    warnings.append(f"'{barcode}' ({len(barcode)}자리) - {product_name}")
+                # 1차 전처리: 바코드 내부 공백이나 하이픈 제거
+                barcode = barcode.replace(" ", "").replace("-", "")
+
+                # 바코드와 제품명이 둘 다 완전히 비어있을 때만 버림
+                if not barcode and not product_name:
                     continue
+
+                # 바코드 형식이 이상하더라도 데이터는 살려두고 경고만 띄움
+                if barcode and (not barcode.isdigit() or len(barcode) not in (8, 12, 13, 14)):
+                    warnings.append(f"바코드 형식 확인필요: '{barcode}' - {product_name}")
 
                 try:
                     qty = int(qty)
