@@ -15,6 +15,7 @@
 
 import io
 import json
+import re
 import time
 from pathlib import Path
 
@@ -201,6 +202,51 @@ def apply_lookup(df: pd.DataFrame, ref_dict: dict) -> pd.DataFrame:
     return df
 
 
+def sanitize_json_text(text: str) -> str:
+    """Gemini 응답에서 JSON 파싱 전 제어 문자·불량 따옴표 정화"""
+    # 1) 제어 문자 제거 (탭·줄바꿈은 유지)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # 2) JSON 문자열 값 내부의 이스케이프 안 된 큰따옴표 처리
+    #    "key": "value with "bad" quote" → "key": "value with 'bad' quote"
+    def _fix_inner_quotes(m):
+        key_part = m.group(1)   # 키: "..."
+        val = m.group(2)        # 값 내용 (양쪽 따옴표 제외)
+        # 값 내부의 큰따옴표를 작은따옴표로 치환
+        val_fixed = val.replace('"', "'")
+        return f'{key_part}"{val_fixed}"'
+    # product_name 값 내부 따옴표 집중 수정
+    text = re.sub(
+        r'("product_name"\s*:\s*)"((?:[^"\\]|\\.)*)"',
+        _fix_inner_quotes,
+        text,
+    )
+    # 3) 후행 쉼표 제거 (,] 또는 ,})
+    text = re.sub(r',\s*([\]\}])', r'\1', text)
+    return text
+
+
+def regex_fallback_parse(text: str) -> list:
+    """JSON 파싱 완전 실패 시, 정규식으로 바코드·수량·제품명 추출하는 백업 로직"""
+    items = []
+    # 패턴: product_name, barcode, qty 가 포함된 객체 블록을 개별 매칭
+    pattern = re.compile(
+        r'"product_name"\s*:\s*"([^"]*)"'
+        r'.*?"barcode"\s*:\s*"(\d+)"'
+        r'.*?"qty"\s*:\s*(\d+)',
+        re.DOTALL,
+    )
+    # 각 { ... } 블록을 찾아서 개별 파싱
+    for block in re.finditer(r'\{[^{}]*\}', text):
+        m = pattern.search(block.group())
+        if m:
+            items.append({
+                "product_name": m.group(1).strip(),
+                "barcode": m.group(2).strip(),
+                "qty": int(m.group(3)),
+            })
+    return items
+
+
 def analyze_image(uploaded_file, max_retries=3):
     """Gemini API로 이미지에서 바코드+수량+제품명 추출"""
     model = configure_gemini()
@@ -228,8 +274,11 @@ def analyze_image(uploaded_file, max_retries=3):
 - 수량은 보통 1~999 범위의 작은 정수입니다.
 - 단가나 금액과 혼동하지 마세요.
 
-[응답 형식]
-반드시 아래 형식의 JSON 객체로만 응답하세요. 마크다운이나 다른 설명은 절대 포함하지 마세요:
+[응답 형식 - 반드시 준수]
+- 반드시 아래 형식의 순수 JSON 객체로만 응답하세요.
+- 마크다운, 설명, 주석은 절대 포함하지 마세요.
+- product_name 값 안에 큰따옴표(")를 절대 사용하지 마세요. 필요 시 작은따옴표(')로 대체하세요.
+- 모든 문자열 값은 깨끗하게, 제어 문자 없이 작성하세요.
 
 {"items": [{"product_name": "제품명/규격", "barcode": "8801234567890", "qty": 3}, {"product_name": "제품명/규격", "barcode": "8809876543210", "qty": 1}]}"""
 
@@ -242,14 +291,31 @@ def analyze_image(uploaded_file, max_retries=3):
             response = model.generate_content([prompt, img])
             text = response.text.strip()
 
-            # JSON 추출 (JSON 모드이므로 순수 JSON 반환, 폴백으로 코드블록 처리)
+            # JSON 추출 (코드블록 래핑 제거)
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
 
-            parsed = json.loads(text)
-            # JSON 모드: {"items": [...]} 형태 또는 직접 배열 [...] 둘 다 지원
+            # JSON 정화: 제어 문자·불량 따옴표·후행 쉼표 처리
+            text = sanitize_json_text(text)
+
+            # JSON 파싱 시도 → 실패 시 정규식 백업
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as json_err:
+                print(f"[WARN] JSON 파싱 실패: {json_err}")
+                print(f"[WARN] 원본 텍스트(앞 500자): {text[:500]}")
+                # 정규식 백업 파싱
+                items = regex_fallback_parse(text)
+                if items:
+                    st.warning(f"⚠️ JSON 파싱 오류 발생 → 정규식으로 {len(items)}개 항목 복구")
+                else:
+                    st.error("❌ JSON 파싱 및 정규식 백업 모두 실패")
+                    raise json_err
+                parsed = {"items": items}
+
+            # {"items": [...]} 형태 또는 직접 배열 [...] 둘 다 지원
             if isinstance(parsed, dict):
                 items = parsed.get("items", [])
             else:
