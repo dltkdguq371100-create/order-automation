@@ -464,6 +464,10 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
             )
             text = response.choices[0].message.content.strip()
 
+            # ── 디버깅: AI 원본 응답 화면에 출력 ──
+            with st.expander("🔍 [DEBUG] AI 원본 응답 보기", expanded=False):
+                st.text_area("AI 응답 원문", text, height=300)
+
             # JSON 추출 (코드블록 래핑 제거)
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
@@ -529,6 +533,11 @@ def analyze_image(uploaded_file, mart_type="와", max_retries=3):
                     "수량": qty,
                     "제품명": product_name,
                 })
+
+            # ── 디버깅: 파싱 결과가 비어있을 때 원본 응답 강제 출력 ──
+            if not results:
+                st.error("❌ AI 응답에서 추출된 항목이 0개입니다. 아래에서 AI 원본 응답을 확인하세요.")
+                st.text_area("AI 원본 응답 (items 0개)", text, height=400)
 
             return results, warnings
 
